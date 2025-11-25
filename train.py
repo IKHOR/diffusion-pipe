@@ -337,6 +337,9 @@ if __name__ == '__main__':
     elif model_type == 'qwen_image':
         from models import qwen_image
         model = qwen_image.QwenImagePipeline(config)
+    elif model_type == 'qwen_image_plus':
+        from models import qwen_image_plus
+        model = qwen_image_plus.QwenImagePlusPipeline(config)
     elif model_type == 'hunyuan_image':
         from models import hunyuan_image
         model = hunyuan_image.HunyuanImagePipeline(config)
