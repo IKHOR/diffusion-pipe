@@ -32,6 +32,19 @@ ROUND_DECIMAL_DIGITS = 3
 
 UNCOND_FRACTION = 0.0
 
+def _base_stem(path: Path) -> str:
+    """Normalize stems so target/control variants match.
+
+    0160..._target  -> 0160...
+    0160..._control -> 0160...
+    0160..._src     -> 0160...
+    """
+    stem = path.stem  # e.g. '0160aa..._target'
+    for suffix in ('_target', '_control', '_src'):
+        if stem.endswith(suffix):
+            return stem[: -len(suffix)]
+    return stem
+
 
 def shuffle_with_seed(l, seed=None):
     rng_state = random.getstate()
@@ -366,6 +379,7 @@ class DirectoryDataset:
         self.path = Path(self.directory_config['path'])
         self.mask_path = Path(self.directory_config['mask_path']) if 'mask_path' in self.directory_config else None
         self.control_path = Path(self.directory_config['control_path']) if 'control_path' in self.directory_config else None
+        self.control_path_2 = Path(self.directory_config['control_path_2']) if 'control_path_2' in self.directory_config else None
         # For testing. Default if a mask is missing.
         self.default_mask_file = Path(self.directory_config['default_mask_file']) if 'default_mask_file' in self.directory_config else None
         self.cache_dir = self.path / 'cache' / self.model_name
@@ -377,6 +391,8 @@ class DirectoryDataset:
             raise RuntimeError(f'Invalid mask_path: {self.mask_path}')
         if self.control_path is not None and (not self.control_path.exists() or not self.control_path.is_dir()):
             raise RuntimeError(f'Invalid control_path: {self.control_path}')
+        if self.control_path_2 is not None and (not self.control_path_2.exists() or not self.control_path_2.is_dir()):
+            raise RuntimeError(f'Invalid control_path_2: {self.control_path_2}')
         if self.default_mask_file is not None and (not self.default_mask_file.exists() or not self.default_mask_file.is_file()):
             raise RuntimeError(f'Invalid default_mask_file: {self.default_mask_file}')
 
@@ -501,14 +517,15 @@ class DirectoryDataset:
 
         if regenerate_cache or not metadata_cache_file_1.exists() or not trust_cache:
             print('Intermediate metadata is not cached. Enumerating all files.')
-            files = list(self.path.glob('*'))
+            files = list[Path](self.path.glob('*'))
             # deterministic order
             files.sort()
 
             # Mask can have any extension, it just needs to have the same stem as the image.
-            mask_file_stems = {path.stem: path for path in self.mask_path.glob('*') if path.is_file()} if self.mask_path is not None else {}
-            control_file_stems = {path.stem: path for path in self.control_path.glob('*') if path.is_file()} if self.control_path is not None else {}
-
+            mask_file_stems = {_base_stem(path): path for path in self.mask_path.glob('*') if path.is_file()} if self.mask_path is not None else {}
+            control_file_stems = {_base_stem(path): path for path in self.control_path.glob('*') if path.is_file()} if self.control_path is not None else {}
+            control_file_2_stems = {_base_stem(path): path for path in self.control_path_2.glob('*') if path.is_file()} if self.control_path_2 is not None else {}
+            
             def process_file(file):
                 if file.suffix != '.tar':
                     return [(None, str(file))]
@@ -522,19 +539,21 @@ class DirectoryDataset:
             caption_files = []
             mask_files = []
             control_files = []
+            control_files_2 = []
             for file in tqdm(files):
                 if not file.is_file() or file.suffix == '.txt' or file.suffix == '.npz' or file.suffix == '.json' or file.suffix == '.parquet':
                     continue
                 for image_spec in process_file(file):
                     image_file = Path(image_spec[1])
+                    base = _base_stem(image_file)
                     caption_file = image_file.with_suffix('.txt')
                     if has_captions_json or not os.path.exists(caption_file):
                         caption_file = ''
                     image_specs.append(image_spec)
                     caption_files.append(str(caption_file))
                     # mask
-                    if image_file.stem in mask_file_stems:
-                        mask_files.append(str(mask_file_stems[image_file.stem]))
+                    if base in mask_file_stems:
+                        mask_files.append(str(mask_file_stems[base]))
                     elif self.default_mask_file is not None:
                         mask_files.append(str(self.default_mask_file))
                     else:
@@ -543,14 +562,20 @@ class DirectoryDataset:
                         mask_files.append(None)
                     # control (e.g. Flux Kontext)
                     if self.control_path:
-                        if image_file.stem not in control_file_stems:
+                        if base not in control_file_stems:
                             raise RuntimeError(f'No control file exists for image {image_file}')
-                        control_files.append(str(control_file_stems[image_file.stem]))
+                        control_files.append(str(control_file_stems[base]))
+                    if self.control_path_2:
+                        if base not in control_file_2_stems:
+                            raise RuntimeError(f'No control_file_2 exists for image {image_file}')
+                        control_files_2.append(str(control_file_2_stems[base]))
             assert len(image_specs) > 0, f'Directory {self.path} had no images/videos!'
 
             d = {'image_spec': image_specs, 'caption_file': caption_files, 'mask_file': mask_files}
             if self.control_path:
                 d['control_file'] = control_files
+            if self.control_path_2:
+                d['control_file_2'] = control_files_2
             metadata_dataset = datasets.Dataset.from_dict(d)
 
             if captions_json.exists():
@@ -633,6 +658,8 @@ class DirectoryDataset:
             empty_return = {'image_spec': [], 'mask_file': [], 'caption': [], 'ar_bucket': [], 'size_bucket': [], 'is_video': []}
             if self.control_path:
                 empty_return['control_file'] = []
+            if self.control_path_2:
+                empty_return['control_file_2'] = []
 
             if image_spec[0] is None:
                 tar_f = None
@@ -699,6 +726,8 @@ class DirectoryDataset:
             }
             if self.control_path:
                 ret['control_file'] = [example['control_file'][0]]
+            if self.control_path_2:
+                ret['control_file_2'] = [example['control_file_2'][0]]
             return ret
 
         return fn
@@ -935,12 +964,14 @@ def _cache_fn(datasets, queue, preprocess_media_file_fn, num_text_encoders, rege
 
     def latents_map_fn(example, rank):
         is_edit_dataset = ('control_file' in example)
+        control_keys = [k for k in ('control_file', 'control_file_2') if k in example]
         first_size_bucket = example['size_bucket'][0]
         tensors_and_masks = []
         image_specs = []
         captions = []
         control_tensors_and_masks = []
-        for i, (image_spec, mask_path, size_bucket, caption) in enumerate(
+        control_tensors = []
+        for i, (image_spec, mask_path, size_bucket, caption) in enumerate[tuple](
             zip(example['image_spec'], example['mask_file'], example['size_bucket'], example['caption'])
         ):
             assert size_bucket == first_size_bucket
@@ -949,13 +980,16 @@ def _cache_fn(datasets, queue, preprocess_media_file_fn, num_text_encoders, rege
             image_specs.extend([image_spec] * len(items))
             captions.extend([caption] * len(items))
             if is_edit_dataset:
-                control_file = example['control_file'][i]
-                control_items = preprocess_media_file_fn((None, control_file), None, size_bucket)
-                assert len(control_items) == 1
                 assert len(items) == 1
-                control_tensors_and_masks.append(control_items[0])
+                per_item_controls = []
+                for ck in control_keys:
+                    cf = example[ck][i]
+                    c_items = preprocess_media_file_fn((None, cf), None, size_bucket)
+                    assert len(c_items) == 1
+                    per_item_controls.append(c_items[0][0])  # just the tensor
+                control_tensors.append(per_item_controls)
             else:
-                control_tensors_and_masks.append(None)
+                control_tensors.append([])
 
         if len(tensors_and_masks) == 0:
             assert not is_edit_dataset
@@ -965,9 +999,16 @@ def _cache_fn(datasets, queue, preprocess_media_file_fn, num_text_encoders, rege
         results = defaultdict(list)
         for i in range(0, len(tensors_and_masks), caching_batch_size):
             tensor = torch.stack([t[0] for t in tensors_and_masks[i:i+caching_batch_size]])
-            c_tensor = torch.stack([t[0] for t in control_tensors_and_masks[i:i+caching_batch_size]]) if is_edit_dataset else None
+            num_controls = len(control_keys)
             parent_conn, child_conn = pipes.setdefault(rank, mp.Pipe(duplex=False))
-            queue.put((0, tensor, c_tensor, child_conn))
+
+            if is_edit_dataset:
+                chunk_controls = control_tensors[i:i+caching_batch_size]
+                controls_per_idx = list(zip(*chunk_controls))  # length = num_controls
+                control_batches = [torch.stack(tensors) for tensors in controls_per_idx]
+                queue.put((0, tensor, *control_batches, child_conn))
+            else:
+                queue.put((0, tensor, child_conn))
             result = parent_conn.recv()  # dict
             for k, v in result.items():
                 results[k].append(v)
@@ -1089,10 +1130,13 @@ class DatasetManager:
                     submodel.to('cpu')
             self.submodels[id].to('cuda')
         if id == 0:
-            tensor, control_tensor, pipe = task[1:]
-            if control_tensor is not None:
-                # edit dataset
-                results = self.call_vae_fn(tensor, control_tensor)
+            # task = (0, tensor, [control1, control2, ...], pipe)
+            *payload, pipe = task[1:]
+            tensor = payload[0]
+            control_tensors = payload[1:] 
+
+            if len(control_tensors) > 0:
+                results = self.call_vae_fn(tensor, *control_tensors)
             else:
                 results = self.call_vae_fn(tensor)
         elif id > 0:

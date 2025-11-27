@@ -302,13 +302,13 @@ class QwenImagePlusPipeline(BasePipeline):
 
             if len(args) > 1:
                 control_images = args[1:]  # any number of control images
-                control_latents_list = []
+                control_latents  = []
                 for ci in control_images:
                     cl = vae.encode(ci.to(vae.device, vae.dtype)).latent_dist.mode()
                     cl = (cl - vae.latents_mean_tensor) / vae.latents_std_tensor
-                    control_latents_list.append(cl)
+                    control_latents.append(cl)
                 # stack: list of [B, C, F, H, W] -> [K, B, C, F, H, W]
-                control_latents = torch.stack(control_latents_list, dim=0)
+                control_latents = torch.stack(control_latents, dim=1)
                 result["control_latents"] = control_latents
             return result
         return fn
@@ -363,9 +363,12 @@ class QwenImagePlusPipeline(BasePipeline):
                 control_files = [control_files]
             images = [self.load_image_for_vlm(file) for file in control_files]
 
-            base_img_prompt = "".join(self.img_prompt_template.format(i + 1) for i in range(len(images)))
-            txt = [template.format(base_img_prompt + e) for e in prompt]
+            assert len(prompt) == len(images), f"len(prompt)={len(prompt)} != len(images)={len(images)}"
 
+            txt = [
+                template.format(self.img_prompt_template.format(1) + e)
+                for e in prompt
+            ]
             model_inputs = self.processor(
                 text=txt,
                 images=images,
@@ -397,6 +400,7 @@ class QwenImagePlusPipeline(BasePipeline):
 
     def prepare_inputs(self, inputs, timestep_quantile=None):
         latents = inputs['latents'].float()
+        raw_dim = latents.dim()
         prompt_embeds = inputs['prompt_embeds']
         mask = inputs['mask']
         device = latents.device
@@ -462,12 +466,12 @@ class QwenImagePlusPipeline(BasePipeline):
 
         if 'control_latents' in inputs:
             control_latents = inputs['control_latents'].float()
-            if control_latents.dim() == latents.dim():
-                control_latents = control_latents.unsqueeze(0)
-            if control_latents.dim() != latents.dim() + 1:
-                raise ValueError(f'Unexpected control_latents shape {control_latents.shape}')
+            if control_latents.dim() == raw_dim:
+                control_latents = control_latents.unsqueeze(1)
+            if control_latents.dim() != raw_dim + 1:
+                raise ValueError(f'Unexpected control_latents shape {control_latents.shape}, {latents.shape}')
 
-            num_controls, bs_cl, c_cl, f_cl, h_cl, w_cl = control_latents.shape
+            bs_cl, num_controls, c_cl, f_cl, h_cl, w_cl = control_latents.shape
             if bs_cl != bs:
                 raise ValueError(f'control_latents batch mismatch: {bs_cl} vs {bs}')
             if c_cl != channels or f_cl != num_frames:
@@ -475,7 +479,7 @@ class QwenImagePlusPipeline(BasePipeline):
 
             packed_controls = []
             for k in range(num_controls):
-                cl = control_latents[k]
+                cl = control_latents[:, k]  # [bs, C, F, H, W] for control k
                 cl = self._pack_latents(cl, bs, num_channels_latents, h_cl, w_cl)
                 packed_controls.append(cl)
                 img_shapes.append((1, h_cl // 2, w_cl // 2))
